@@ -60,11 +60,29 @@ public interface TableView<T> extends Closeable {
     T get(String key);
 
     /**
+     * Returns the {@link Message} to which the specified key is mapped, or null if this map contains
+     * no mapping for the key.
+     *
+     * @param key the key whose associated Message is to be returned
+     * @return the Message object associated with the key or null if the key was not found
+     */
+    Message<T> getMessage(String key);
+
+    /**
      * Returns a Set view of the mappings contained in this map.
      *
      * @return a set view of the mappings contained in this map
      */
     Set<Map.Entry<String, T>> entrySet();
+
+    /**
+     * Returns a Set view of the key-{@link Message} mappings contained in this TableView.
+     * Each entry provides access to both the key and the complete Message object
+     * with metadata such as publish time, message ID, and properties.
+     *
+     * @return a set view of the key-Message mappings contained in this TableView
+     */
+    Set<Map.Entry<String, Message<T>>> entrySetMessages();
 
     /**
      * Returns a {@link Set} view of the keys contained in this {@link TableView}.
@@ -81,12 +99,27 @@ public interface TableView<T> extends Closeable {
     Collection<T> values();
 
     /**
+     * Returns a Collection view of the {@link Message}s contained in this TableView.
+     *
+     * @return a collection view of the Message objects contained in this TableView
+     */
+    Collection<Message<T>> messages();
+
+    /**
      * Performs the given action for each entry in this map until all entries
      * have been processed or the action throws an exception.
      *
      * @param action The action to be performed for each entry
      */
     void forEach(BiConsumer<String, T> action);
+
+    /**
+     * Performs the given action for each key-{@link Message} pair in this TableView until all entries
+     * have been processed or the action throws an exception.
+     *
+     * @param action The action to be performed for each key-Message entry
+     */
+    void forEachMessage(BiConsumer<String, Message<T>> action);
 
     /**
      * Performs the given action for each future entry in this map until all entries
@@ -97,12 +130,30 @@ public interface TableView<T> extends Closeable {
     void listen(BiConsumer<String, T> action);
 
     /**
+     * Registers a listener that will be invoked for each new key-{@link Message} pair added to this
+     * TableView in the future. The listener will not be called for existing entries, only
+     * for new messages received after this method is called.
+     *
+     * @param action The action to be performed for each new key-Message entry
+     */
+    void listenMessages(BiConsumer<String, Message<T>> action);
+
+    /**
      * Performs the given action for each entry in this map until all entries
      * have been processed or the action throws an exception.
      *
      * @param action The action to be performed for each entry
      */
     void forEachAndListen(BiConsumer<String, T> action);
+
+    /**
+     * Performs the given action for each existing key-{@link Message} pair in this TableView,
+     * then registers a listener for new entries. This is an atomic operation that ensures
+     * no messages are missed between the iteration and listener registration.
+     *
+     * @param action The action to be performed for each existing and future key-Message entry
+     */
+    void forEachMessageAndListen(BiConsumer<String, Message<T>> action);
 
     /**
      * Close the table view and releases resources allocated.

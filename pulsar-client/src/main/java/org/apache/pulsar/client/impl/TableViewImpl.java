@@ -22,6 +22,7 @@ import static org.apache.pulsar.common.topics.TopicCompactionStrategy.TABLE_VIEW
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -51,12 +52,13 @@ public class TableViewImpl<T> implements TableView<T> {
 
     private final TableViewConfigurationData conf;
 
-    private final ConcurrentMap<String, T> data;
-    private final Map<String, T> immutableData;
+    private final ConcurrentMap<String, Message<T>> data;
+    private final Map<String, Message<T>> immutableData;
 
     private final CompletableFuture<Reader<T>> reader;
 
     private final List<BiConsumer<String, T>> listeners;
+    private final List<BiConsumer<String, Message<T>>> messageListeners;
     private final ReentrantLock listenersMutex;
     private final boolean isPersistentTopic;
     private TopicCompactionStrategy<T> compactionStrategy;
@@ -87,6 +89,7 @@ public class TableViewImpl<T> implements TableView<T> {
         this.data = new ConcurrentHashMap<>();
         this.immutableData = Collections.unmodifiableMap(data);
         this.listeners = new ArrayList<>();
+        this.messageListeners = new ArrayList<>();
         this.listenersMutex = new ReentrantLock();
         this.compactionStrategy =
                 TopicCompactionStrategy.load(TABLE_VIEW_TAG, conf.getTopicCompactionStrategyClassName());
@@ -97,7 +100,6 @@ public class TableViewImpl<T> implements TableView<T> {
                 .startMessageId(MessageId.earliest)
                 .autoUpdatePartitions(true)
                 .autoUpdatePartitionsInterval((int) conf.getAutoUpdatePartitionsSeconds(), TimeUnit.SECONDS)
-                .poolMessages(true)
                 .subscriptionName(conf.getSubscriptionName());
         if (isPersistentTopic) {
             readerBuilder.readCompacted(true);
@@ -141,12 +143,25 @@ public class TableViewImpl<T> implements TableView<T> {
 
     @Override
     public T get(String key) {
-       return data.get(key);
+        Message<T> message = data.get(key);
+        return message != null ? message.getValue() : null;
+    }
+
+    @Override
+    public Message<T> getMessage(String key) {
+        return data.get(key);
     }
 
     @Override
     public Set<Map.Entry<String, T>> entrySet() {
-       return immutableData.entrySet();
+        Map<String, T> valueMap = new HashMap<>();
+        immutableData.forEach((key, message) -> valueMap.put(key, message.getValue()));
+        return Collections.unmodifiableMap(valueMap).entrySet();
+    }
+
+    @Override
+    public Set<Map.Entry<String, Message<T>>> entrySetMessages() {
+        return immutableData.entrySet();
     }
 
     @Override
@@ -156,11 +171,23 @@ public class TableViewImpl<T> implements TableView<T> {
 
     @Override
     public Collection<T> values() {
+        List<T> valueList = new ArrayList<>();
+        immutableData.forEach((key, message) -> valueList.add(message.getValue()));
+        return Collections.unmodifiableList(valueList);
+    }
+
+    @Override
+    public Collection<Message<T>> messages() {
         return immutableData.values();
     }
 
     @Override
     public void forEach(BiConsumer<String, T> action) {
+        data.forEach((key, message) -> action.accept(key, message.getValue()));
+    }
+
+    @Override
+    public void forEachMessage(BiConsumer<String, Message<T>> action) {
         data.forEach(action);
     }
 
@@ -169,6 +196,16 @@ public class TableViewImpl<T> implements TableView<T> {
         try {
             listenersMutex.lock();
             listeners.add(action);
+        } finally {
+            listenersMutex.unlock();
+        }
+    }
+
+    @Override
+    public void listenMessages(BiConsumer<String, Message<T>> action) {
+        try {
+            listenersMutex.lock();
+            messageListeners.add(action);
         } finally {
             listenersMutex.unlock();
         }
@@ -190,6 +227,21 @@ public class TableViewImpl<T> implements TableView<T> {
     }
 
     @Override
+    public void forEachMessageAndListen(BiConsumer<String, Message<T>> action) {
+        // Ensure we iterate over all the existing entry _and_ start the listening from the exact next message
+        try {
+            listenersMutex.lock();
+
+            // Execute the action over existing entries
+            forEachMessage(action);
+
+            messageListeners.add(action);
+        } finally {
+            listenersMutex.unlock();
+        }
+    }
+
+    @Override
     public CompletableFuture<Void> closeAsync() {
         return reader.thenCompose(Reader::closeAsync);
     }
@@ -205,56 +257,61 @@ public class TableViewImpl<T> implements TableView<T> {
 
     private void handleMessage(Message<T> msg) {
         lastReadPositions.put(msg.getTopicName(), msg.getMessageId());
-        try {
-            if (msg.hasKey()) {
-                String key = msg.getKey();
-                T cur = msg.size() > 0 ? msg.getValue() : null;
-                if (log.isDebugEnabled()) {
-                    log.debug("Applying message from topic {}. key={} value={}",
+        if (msg.hasKey()) {
+            String key = msg.getKey();
+            T cur = msg.size() > 0 ? msg.getValue() : null;
+            if (log.isDebugEnabled()) {
+                log.debug("Applying message from topic {}. key={} value={}",
+                        conf.getTopicName(),
+                        key,
+                        cur);
+            }
+
+            boolean update = true;
+            if (compactionStrategy != null) {
+                Message<T> prev = data.get(key);
+                T prevValue = prev != null ? prev.getValue() : null;
+                update = !compactionStrategy.shouldKeepLeft(prevValue, cur);
+                if (!update) {
+                    log.info("Skipped the message from topic {}. key={} value={} prev={}",
                             conf.getTopicName(),
                             key,
-                            cur);
-                }
-
-                boolean update = true;
-                if (compactionStrategy != null) {
-                    T prev = data.get(key);
-                    update = !compactionStrategy.shouldKeepLeft(prev, cur);
-                    if (!update) {
-                        log.info("Skipped the message from topic {}. key={} value={} prev={}",
-                                conf.getTopicName(),
-                                key,
-                                cur,
-                                prev);
-                        compactionStrategy.handleSkippedMessage(key, cur);
-                    }
-                }
-
-                if (update) {
-                    try {
-                        listenersMutex.lock();
-                        if (null == cur) {
-                            data.remove(key);
-                        } else {
-                            data.put(key, cur);
-                        }
-
-                        for (BiConsumer<String, T> listener : listeners) {
-                            try {
-                                listener.accept(key, cur);
-                            } catch (Throwable t) {
-                                log.error("Table view listener raised an exception", t);
-                            }
-                        }
-                    } finally {
-                        listenersMutex.unlock();
-                    }
+                            cur,
+                            prevValue);
+                    compactionStrategy.handleSkippedMessage(key, cur);
                 }
             }
-            checkAllFreshTask(msg);
-        } finally {
-            msg.release();
+
+            if (update) {
+                try {
+                    listenersMutex.lock();
+                    if (null == cur) {
+                        data.remove(key);
+                    } else {
+                        data.put(key, msg);
+                    }
+
+                    for (BiConsumer<String, T> listener : listeners) {
+                        try {
+                            listener.accept(key, cur);
+                        } catch (Throwable t) {
+                            log.error("Table view listener raised an exception", t);
+                        }
+                    }
+
+                    for (BiConsumer<String, Message<T>> messageListener : messageListeners) {
+                        try {
+                            messageListener.accept(key, msg);
+                        } catch (Throwable t) {
+                            log.error("Table view message listener raised an exception", t);
+                        }
+                    }
+                } finally {
+                    listenersMutex.unlock();
+                }
+            }
         }
+        checkAllFreshTask(msg);
     }
 
     @Override

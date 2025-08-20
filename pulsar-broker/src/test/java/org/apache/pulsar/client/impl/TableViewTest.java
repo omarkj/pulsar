@@ -32,8 +32,10 @@ import static org.testng.Assert.fail;
 import com.google.common.collect.Sets;
 import java.lang.reflect.Method;
 import java.time.Duration;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -570,6 +572,52 @@ public class TableViewTest extends MockedPulsarServiceBaseTest {
             assertEquals(tv.size(), msgCnt);
         });
         verify(consumer, times(msgCnt)).receiveAsync();
+    }
+
+    @Test(timeOut = 30 * 1000)
+    public void testGetMessage() throws Exception {
+        String topic = "persistent://public/default/tableview-message-methods-test";
+        admin.topics().createPartitionedTopic(topic, 2);
+        
+        @Cleanup
+        TableView<String> tv = pulsarClient.newTableView(Schema.STRING)
+                .topic(topic)
+                .autoUpdatePartitionsInterval(60, TimeUnit.SECONDS)
+                .create();
+
+        @Cleanup
+        Producer<String> producer = pulsarClient.newProducer(Schema.STRING).topic(topic).create();
+
+        // Send test message
+        String key = "test-key";
+        String value = "test-value";
+        producer.newMessage().key(key).value(value).send();
+
+        // Wait for message to be received
+        Awaitility.await().untilAsserted(() -> assertEquals(tv.size(), 1));
+
+        // Test get() returns the value
+        assertEquals(tv.get(key), value);
+        
+        // Test getMessage() returns the Message object
+        Message<String> message = tv.getMessage(key);
+        Assert.assertNotNull(message);
+        assertEquals(message.getValue(), value);
+        assertEquals(message.getKey(), key);
+        Assert.assertTrue(message.hasKey());
+        
+        // Test entrySetMessages() method  
+        assertEquals(tv.entrySetMessages().size(), 1);
+        
+        // Test messages() method
+        assertEquals(tv.messages().size(), 1);
+        
+        // Test forEachMessage() method works
+        tv.forEachMessage((k, msg) -> {
+            assertEquals(k, key);
+            assertEquals(msg.getValue(), value);
+            assertEquals(msg.getKey(), key);
+        });
     }
 
     @Test
